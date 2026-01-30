@@ -30,10 +30,12 @@ import {
   VoiceConnection,
   AudioPlayer,
   EndBehaviorType,
+  StreamType,
 } from "@discordjs/voice";
 import winston from "winston";
 import path from "path";
 import { Readable, pipeline } from "stream";
+import prism from "prism-media";
 import type {
   WOPRPlugin,
   WOPRPluginContextWithVoice,
@@ -70,6 +72,49 @@ const logger = winston.createLogger({
 
 let client: Client | null = null;
 let ctx: WOPRPluginContextWithVoice | null = null;
+
+/**
+ * Resample mono PCM to stereo at target sample rate using linear interpolation
+ * @param input Input PCM buffer (mono, s16le)
+ * @param inputRate Input sample rate (e.g., 22050)
+ * @param outputRate Output sample rate (e.g., 48000)
+ * @returns Output PCM buffer (stereo, s16le)
+ */
+function resamplePCM(input: Buffer, inputRate: number, outputRate: number): Buffer {
+  const inputSamples = input.length / 2; // 2 bytes per sample (s16le)
+  const ratio = outputRate / inputRate;
+  const outputSamples = Math.floor(inputSamples * ratio);
+  const output = Buffer.alloc(outputSamples * 4); // 2 channels * 2 bytes
+
+  for (let i = 0; i < outputSamples; i++) {
+    // Calculate the position in the input buffer
+    const inputPos = i / ratio;
+    const inputIndex = Math.floor(inputPos);
+    const frac = inputPos - inputIndex;
+
+    // Linear interpolation between samples
+    let sample: number;
+    if (inputIndex + 1 < inputSamples) {
+      const s1 = input.readInt16LE(inputIndex * 2);
+      const s2 = input.readInt16LE((inputIndex + 1) * 2);
+      sample = Math.round(s1 + frac * (s2 - s1));
+    } else if (inputIndex < inputSamples) {
+      sample = input.readInt16LE(inputIndex * 2);
+    } else {
+      sample = 0;
+    }
+
+    // Clamp to int16 range
+    sample = Math.max(-32768, Math.min(32767, sample));
+
+    const outputOffset = i * 4;
+    // Write to both channels (stereo)
+    output.writeInt16LE(sample, outputOffset); // Left
+    output.writeInt16LE(sample, outputOffset + 2); // Right
+  }
+
+  return output;
+}
 
 // Voice connection management
 const connections = new Map<string, VoiceConnection>();
@@ -157,6 +202,9 @@ async function joinChannel(
     adapterCreator: voiceAdapterCreator,
     selfDeaf: false,
     selfMute: false,
+    // Disable DAVE E2E encryption - use legacy encryption for receiving audio
+    daveEncryption: false,
+    debug: true,
   });
 
   // Wait for connection to be ready
@@ -242,19 +290,64 @@ function startListening(guildId: string, connection: VoiceConnection): void {
       },
     });
 
+    logger.debug({ msg: "Subscribed to audio stream", userId });
+
+    // Debug: Track data flow
+    let packetCount = 0;
+    audioStream.on("data", (chunk: Buffer) => {
+      packetCount++;
+      if (packetCount <= 3 || packetCount % 50 === 0) {
+        logger.debug({ msg: "Audio packet received", userId, packetCount, size: chunk.length });
+      }
+    });
+
+    audioStream.on("error", (err) => {
+      logger.error({ msg: "Audio stream error", userId, error: String(err) });
+    });
+
+    audioStream.on("end", () => {
+      logger.debug({ msg: "Audio stream ended", userId, totalPackets: packetCount });
+      // When stream ends (Discord's silence detection), transcribe what we have
+      logger.info({ msg: "Stream ended - triggering transcription", guildId, userId });
+      transcribeUserSpeech(guildId, userId).catch((err) => {
+        logger.error({ msg: "Transcription from stream-end failed", error: String(err) });
+      });
+    });
+
     // Convert Opus -> PCM 16kHz mono
     const converter = new OpusToPCMConverter();
+    converter.on("error", (err) => {
+      logger.error({ msg: "Converter error", userId, error: String(err) });
+    });
+
+    let converterOutputCount = 0;
+    converter.on("data", (chunk: Buffer) => {
+      converterOutputCount++;
+      if (converterOutputCount <= 3 || converterOutputCount % 50 === 0) {
+        logger.debug({ msg: "Converter output", userId, count: converterOutputCount, size: chunk.length });
+      }
+    });
 
     // VAD for speech detection
     const config = ctx?.getConfig<any>() || {};
+    logger.debug({ msg: "Creating VAD", userId, vadThreshold: config.vadThreshold ?? 500, vadSilenceMs: config.vadSilenceMs ?? 1500 });
     const vad = new VADDetector({
       silenceThreshold: config.vadThreshold ?? 500,
       silenceDurationMs: config.vadSilenceMs ?? 1500,
       sampleRate: 16000,
     });
 
+    vad.on("error", (err) => {
+      logger.error({ msg: "VAD error", userId, error: String(err) });
+    });
+
+    vad.on("speech-start", () => {
+      logger.info({ msg: "VAD: Speech start detected", guildId, userId });
+    });
+
     // Buffer audio chunks
     const bufferKey = `${guildId}-${userId}`;
+    logger.debug({ msg: "Creating audio buffer", userId, bufferKey });
     audioBuffers.set(bufferKey, {
       chunks: [],
       startTime: Date.now(),
@@ -262,25 +355,34 @@ function startListening(guildId: string, connection: VoiceConnection): void {
       silenceCount: 0,
     });
 
+    let vadOutputCount = 0;
     // Collect PCM chunks
     vad.on("data", (chunk: Buffer) => {
+      vadOutputCount++;
       const buffer = audioBuffers.get(bufferKey);
       if (buffer) {
         buffer.chunks.push(chunk);
         buffer.lastChunkTime = Date.now();
+        if (vadOutputCount <= 3 || vadOutputCount % 50 === 0) {
+          logger.debug({ msg: "VAD output -> buffer", userId, count: vadOutputCount, chunkSize: chunk.length, totalChunks: buffer.chunks.length });
+        }
       }
     });
 
     // When speech ends, transcribe
     vad.on("speech-end", async () => {
-      logger.info({ msg: "Speech ended", guildId, userId });
+      const buffer = audioBuffers.get(bufferKey);
+      logger.info({ msg: "VAD: Speech end detected", guildId, userId, totalChunks: buffer?.chunks.length, vadOutputCount });
       await transcribeUserSpeech(guildId, userId);
     });
 
     // Pipeline: Opus stream -> Opus decoder + resample -> VAD
+    logger.debug({ msg: "Starting audio pipeline", userId });
     pipeline(audioStream, converter, vad, (err) => {
       if (err) {
         logger.error({ msg: "Audio pipeline error", error: String(err) });
+      } else {
+        logger.debug({ msg: "Audio pipeline completed", userId });
       }
     });
   });
@@ -290,29 +392,37 @@ function startListening(guildId: string, connection: VoiceConnection): void {
  * Transcribe user speech using STT
  */
 async function transcribeUserSpeech(guildId: string, userId: string): Promise<void> {
-  if (!ctx) return;
+  logger.debug({ msg: "transcribeUserSpeech called", guildId, userId, hasCtx: !!ctx });
+  if (!ctx) {
+    logger.error({ msg: "No context available", guildId, userId });
+    return;
+  }
 
   const bufferKey = `${guildId}-${userId}`;
   const buffer = audioBuffers.get(bufferKey);
+  logger.debug({ msg: "Audio buffer lookup", bufferKey, hasBuffer: !!buffer, chunks: buffer?.chunks.length });
   if (!buffer || buffer.chunks.length === 0) {
-    logger.debug({ msg: "No audio to transcribe", guildId, userId });
+    logger.warn({ msg: "No audio to transcribe - buffer empty", guildId, userId });
     return;
   }
 
   // Combine all chunks
   const audioPCM = Buffer.concat(buffer.chunks);
+  const duration = (audioPCM.length / 2 / 16000).toFixed(2); // seconds
   audioBuffers.delete(bufferKey);
 
-  logger.info({ msg: "Transcribing audio", guildId, userId, size: audioPCM.length });
+  logger.info({ msg: "Transcribing audio", guildId, userId, size: audioPCM.length, durationSeconds: duration });
 
   // Get STT provider
   const stt = ctx.getSTT();
+  logger.debug({ msg: "STT provider lookup", hasSTT: !!stt });
   if (!stt) {
     logger.warn({ msg: "No STT provider available", guildId });
     return;
   }
 
   try {
+    logger.debug({ msg: "Calling STT transcribe", guildId, audioSize: audioPCM.length });
     // Transcribe audio
     const transcript = await stt.transcribe(audioPCM, {
       format: "pcm_s16le",
@@ -320,8 +430,9 @@ async function transcribeUserSpeech(guildId: string, userId: string): Promise<vo
       language: "en",
     });
 
+    logger.debug({ msg: "STT transcribe returned", transcript, transcriptLength: transcript?.length });
     if (!transcript || transcript.trim().length === 0) {
-      logger.debug({ msg: "Empty transcript", guildId, userId });
+      logger.info({ msg: "Empty transcript", guildId, userId });
       return;
     }
 
@@ -331,18 +442,23 @@ async function transcribeUserSpeech(guildId: string, userId: string): Promise<vo
     const guild = client?.guilds.cache.get(guildId);
     const member = guild?.members.cache.get(userId);
     const username = member?.displayName || member?.user.username || userId;
+    logger.debug({ msg: "User info", username, hasGuild: !!guild, hasMember: !!member });
 
     // Send to WOPR for response
     const sessionKey = `discord-voice-${guildId}`;
+    logger.info({ msg: "Sending to WOPR", sessionKey, transcript, username });
     const response = await ctx.inject(sessionKey, transcript, {
       from: username,
       channel: { type: "discord-voice", id: guildId, name: "voice" },
     });
+    logger.info({ msg: "WOPR response received", responseLength: response?.length, responsePreview: response?.slice(0, 100) });
 
     // Play TTS response
+    logger.debug({ msg: "Calling playTTSResponse", guildId });
     await playTTSResponse(guildId, response);
+    logger.debug({ msg: "playTTSResponse completed", guildId });
   } catch (error) {
-    logger.error({ msg: "Transcription failed", error: String(error) });
+    logger.error({ msg: "Transcription/response failed", error: String(error), stack: (error as any)?.stack });
   }
 }
 
@@ -350,9 +466,14 @@ async function transcribeUserSpeech(guildId: string, userId: string): Promise<vo
  * Play TTS response to voice channel
  */
 async function playTTSResponse(guildId: string, text: string): Promise<void> {
-  if (!ctx) return;
+  logger.debug({ msg: "playTTSResponse called", guildId, textLength: text?.length, hasCtx: !!ctx });
+  if (!ctx) {
+    logger.error({ msg: "No context in playTTSResponse", guildId });
+    return;
+  }
 
   const player = audioPlayers.get(guildId);
+  logger.debug({ msg: "Audio player lookup", guildId, hasPlayer: !!player });
   if (!player) {
     logger.warn({ msg: "No audio player for guild", guildId });
     return;
@@ -360,35 +481,51 @@ async function playTTSResponse(guildId: string, text: string): Promise<void> {
 
   // Get TTS provider
   const tts = ctx.getTTS();
+  logger.debug({ msg: "TTS provider lookup", hasTTS: !!tts });
   if (!tts) {
     logger.warn({ msg: "No TTS provider available", guildId });
     return;
   }
 
   try {
-    logger.info({ msg: "Synthesizing TTS", guildId, text });
+    logger.info({ msg: "Synthesizing TTS", guildId, textLength: text.length, textPreview: text.slice(0, 50) });
 
     // Synthesize speech
     const result = await tts.synthesize(text, {
       format: "pcm_s16le",
-      sampleRate: 16000,
+    });
+    const sampleRate = result.sampleRate || 22050; // Piper default is 22050Hz
+    logger.debug({ msg: "TTS synthesis complete", audioSize: result.audio?.length, format: result.format, sampleRate });
+
+    // Use manual resampling instead of FFmpeg (more reliable)
+    logger.debug({ msg: "Resampling PCM", guildId, inputSampleRate: sampleRate });
+
+    // Resample to 48kHz stereo using our helper function
+    const convertedAudio = resamplePCM(result.audio, sampleRate, 48000);
+    logger.debug({ msg: "Resampling complete", guildId, inputSize: result.audio.length, outputSize: convertedAudio.length });
+
+    // Create a proper readable stream that doesn't end immediately
+    const pcmStream = new Readable({
+      read() {
+        // Push all data at once, then signal end
+        this.push(convertedAudio);
+        this.push(null);
+      }
     });
 
-    // Convert PCM 16kHz mono -> Opus 48kHz stereo
-    const converter = new PCMToOpusConverter();
-    const opusStream = Readable.from(result.audio).pipe(converter);
-
-    // Create audio resource
-    const resource = createAudioResource(opusStream, {
-      inputType: "opus" as any,
+    // Create audio resource with raw s16le input - Discord.js will encode to Opus
+    const resource = createAudioResource(pcmStream, {
+      inputType: StreamType.Raw,
+      inlineVolume: true,
     });
+    logger.debug({ msg: "Audio resource created", guildId, audioLength: convertedAudio.length });
 
     // Play audio
     player.play(resource);
 
     logger.info({ msg: "Playing TTS audio", guildId });
   } catch (error) {
-    logger.error({ msg: "TTS playback failed", error: String(error) });
+    logger.error({ msg: "TTS playback failed", error: String(error), stack: (error as any)?.stack });
   }
 }
 
@@ -417,15 +554,18 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
         return;
       }
 
-      try {
-        const guild = interaction.guild;
-        if (!guild) {
-          await interaction.reply({ content: "❌ Guild not found", ephemeral: true });
-          return;
-        }
+      const guild = interaction.guild;
+      if (!guild) {
+        await interaction.reply({ content: "❌ Guild not found", ephemeral: true });
+        return;
+      }
 
+      // Defer reply since joining can take a few seconds
+      await interaction.deferReply();
+
+      try {
         await joinChannel(guildId, voiceChannel.id, guild.voiceAdapterCreator);
-        await interaction.reply({ content: `🎤 Joined ${voiceChannel.name}!`, ephemeral: false });
+        await interaction.editReply({ content: `🎤 Joined ${voiceChannel.name}!` });
 
         // Check voice capabilities
         const hasVoice = ctx.hasVoice();
@@ -440,7 +580,7 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
         }
       } catch (error) {
         logger.error({ msg: "Failed to join voice channel", error: String(error) });
-        await interaction.reply({ content: "❌ Failed to join voice channel", ephemeral: true });
+        await interaction.editReply({ content: "❌ Failed to join voice channel" });
       }
       break;
     }
@@ -470,24 +610,45 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
 }
 
 /**
- * Register slash commands
+ * Register slash commands - merges with existing commands instead of replacing
  */
 async function registerSlashCommands(token: string, clientId: string, guildId?: string): Promise<void> {
   const rest = new REST({ version: "10" }).setToken(token);
 
   try {
-    logger.info("Registering voice slash commands...");
+    logger.info("Registering voice slash commands (merge mode)...");
+
+    // Get our command names for filtering
+    const voiceCommandNames = new Set(commands.map(cmd => cmd.name));
 
     if (guildId) {
+      // Fetch existing guild commands
+      const existingCommands = await rest.get(Routes.applicationGuildCommands(clientId, guildId)) as any[];
+
+      // Filter out our voice commands from existing (in case of re-registration)
+      const otherCommands = existingCommands.filter((cmd: any) => !voiceCommandNames.has(cmd.name));
+
+      // Merge: keep other commands + add our voice commands
+      const mergedCommands = [...otherCommands, ...commands.map(cmd => cmd.toJSON())];
+
       await rest.put(Routes.applicationGuildCommands(clientId, guildId), {
-        body: commands.map((cmd) => cmd.toJSON()),
+        body: mergedCommands,
       });
-      logger.info(`Registered ${commands.length} voice commands to guild ${guildId}`);
+      logger.info(`Registered ${commands.length} voice commands (merged with ${otherCommands.length} existing) to guild ${guildId}`);
     } else {
+      // Fetch existing global commands
+      const existingCommands = await rest.get(Routes.applicationCommands(clientId)) as any[];
+
+      // Filter out our voice commands from existing
+      const otherCommands = existingCommands.filter((cmd: any) => !voiceCommandNames.has(cmd.name));
+
+      // Merge: keep other commands + add our voice commands
+      const mergedCommands = [...otherCommands, ...commands.map(cmd => cmd.toJSON())];
+
       await rest.put(Routes.applicationCommands(clientId), {
-        body: commands.map((cmd) => cmd.toJSON()),
+        body: mergedCommands,
       });
-      logger.info(`Registered ${commands.length} global voice commands`);
+      logger.info(`Registered ${commands.length} global voice commands (merged with ${otherCommands.length} existing)`);
     }
   } catch (error) {
     logger.error({ msg: "Failed to register voice commands", error: String(error) });
@@ -502,8 +663,8 @@ const plugin: WOPRPlugin = {
   version: "1.0.0",
   description: "Discord voice channel integration with STT/TTS support",
 
-  async init(context: WOPRPluginContextWithVoice) {
-    ctx = context;
+  async init(context) {
+    ctx = context as WOPRPluginContextWithVoice;
     ctx.registerConfigSchema("wopr-plugin-channel-discord-voice", configSchema);
 
     // Check voice capabilities
@@ -518,9 +679,16 @@ const plugin: WOPRPlugin = {
 
     // Get configuration
     let config = ctx.getConfig<{ token?: string; guildId?: string; clientId?: string }>();
-    if (!config?.token) {
-      const legacy = ctx.getMainConfig("discord") as { token?: string };
-      if (legacy?.token) config = { token: legacy.token, clientId: "" };
+    if (!config?.token || !config?.clientId) {
+      // Fall back to main discord config
+      const legacy = ctx.getMainConfig("discord") as { token?: string; clientId?: string; guildId?: string };
+      if (legacy?.token) {
+        config = {
+          token: legacy.token,
+          clientId: legacy.clientId || "",
+          guildId: legacy.guildId,
+        };
+      }
     }
     if (!config?.token || !config?.clientId) {
       logger.warn("Not configured - missing token or clientId");
@@ -550,7 +718,7 @@ const plugin: WOPRPlugin = {
       logger.info({ tag: client?.user?.tag });
 
       // Register slash commands
-      await registerSlashCommands(config.token, config.clientId!, config.guildId);
+      await registerSlashCommands(config.token!, config.clientId!, config.guildId);
     });
 
     // Login to Discord

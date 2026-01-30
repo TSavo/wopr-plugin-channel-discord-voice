@@ -85,7 +85,7 @@ export interface WOPRPlugin {
   name: string;
   version: string;
   description: string;
-  init?: (context: WOPRPluginContext) => Promise<void>;
+  init?: (context: WOPRPluginContext | WOPRPluginContextWithVoice) => Promise<void>;
   shutdown?: () => Promise<void>;
 }
 

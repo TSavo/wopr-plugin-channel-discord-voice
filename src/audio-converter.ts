@@ -78,13 +78,18 @@ export class OpusToPCMConverter extends Transform {
 }
 
 /**
- * Convert PCM 16kHz mono (from TTS) to Discord Opus (48kHz stereo)
+ * Convert PCM mono (from TTS) to Discord Opus (48kHz stereo)
+ * Supports any input sample rate via linear interpolation resampling
  */
 export class PCMToOpusConverter extends Transform {
   private encoder: prism.opus.Encoder;
+  private inputSampleRate: number;
+  private resampleRatio: number;
 
-  constructor() {
+  constructor(inputSampleRate: number = 16000) {
     super();
+    this.inputSampleRate = inputSampleRate;
+    this.resampleRatio = 48000 / inputSampleRate;
 
     // Encode PCM (48kHz stereo) to Opus
     this.encoder = new prism.opus.Encoder({
@@ -103,8 +108,8 @@ export class PCMToOpusConverter extends Transform {
   }
 
   _transform(chunk: Buffer, encoding: string, callback: Function) {
-    // Upsample 16kHz mono to 48kHz stereo
-    const upsampled = this.upsampleAndStereo(chunk);
+    // Resample to 48kHz stereo
+    const upsampled = this.resampleAndStereo(chunk);
     this.encoder.write(upsampled);
     callback();
   }
@@ -115,27 +120,40 @@ export class PCMToOpusConverter extends Transform {
   }
 
   /**
-   * Upsample 16kHz mono PCM to 48kHz stereo
-   * Input: 16kHz, 1 channel, s16le
+   * Resample mono PCM to 48kHz stereo using linear interpolation
+   * Input: any sample rate, 1 channel, s16le
    * Output: 48kHz, 2 channels, s16le
    */
-  private upsampleAndStereo(buffer: Buffer): Buffer {
+  private resampleAndStereo(buffer: Buffer): Buffer {
     const inputSamples = buffer.length / 2; // 2 bytes per sample
-    const outputSamples = inputSamples * 3; // 16kHz -> 48kHz = 3x
+    const outputSamples = Math.floor(inputSamples * this.resampleRatio);
     const output = Buffer.alloc(outputSamples * 4); // 2 channels * 2 bytes
 
-    for (let i = 0; i < inputSamples; i++) {
-      const sample = buffer.readInt16LE(i * 2);
+    for (let i = 0; i < outputSamples; i++) {
+      // Calculate the position in the input buffer
+      const inputPos = i / this.resampleRatio;
+      const inputIndex = Math.floor(inputPos);
+      const frac = inputPos - inputIndex;
 
-      // Repeat each sample 3 times (simple upsampling)
-      for (let j = 0; j < 3; j++) {
-        const outputIndex = i * 3 + j;
-        const outputOffset = outputIndex * 4;
-
-        // Write to both channels (stereo)
-        output.writeInt16LE(sample, outputOffset); // Left
-        output.writeInt16LE(sample, outputOffset + 2); // Right
+      // Linear interpolation between samples
+      let sample: number;
+      if (inputIndex + 1 < inputSamples) {
+        const s1 = buffer.readInt16LE(inputIndex * 2);
+        const s2 = buffer.readInt16LE((inputIndex + 1) * 2);
+        sample = Math.round(s1 + frac * (s2 - s1));
+      } else if (inputIndex < inputSamples) {
+        sample = buffer.readInt16LE(inputIndex * 2);
+      } else {
+        sample = 0;
       }
+
+      // Clamp to int16 range
+      sample = Math.max(-32768, Math.min(32767, sample));
+
+      const outputOffset = i * 4;
+      // Write to both channels (stereo)
+      output.writeInt16LE(sample, outputOffset); // Left
+      output.writeInt16LE(sample, outputOffset + 2); // Right
     }
 
     return output;
